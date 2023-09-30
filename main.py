@@ -1,192 +1,285 @@
-import dataclasses
-import struct
-from dataclasses import dataclass
-import random
 import socket
-from io import BytesIO
+from dataclasses import dataclass, field
+from enum import Enum
+from random import randrange
+from struct import Struct
+from typing import Iterator, Self, Any
 
-random.seed(1)
-
-TYPE_A = 1
-TYPE_NS = 2
-TYPE_TXT = 16
-CLASS_IN = 1
-
-
-@dataclass
-class DNSHeader:
-    id: int
-    flags: int
-    num_questions: int = 0
-    num_answers: int = 0
-    num_authorities: int = 0
-    num_additionals: int = 0
+from utils import unpack_from, encode_name, decode_name
 
 
-@dataclass
-class DNSQuestion:
-    name: bytes
-    type_: int
-    class_: int
+class DnsType(Enum):
+    A = 1
+    NS = 2
+    CNAME = 5
+    SOA = 6
+    PTR = 12
+    MX = 15
+    TXT = 16
+    RP = 17
+    AAAA = 28
+    SRV = 33
 
 
-@dataclass
-class DNSRecord:
-    name: bytes
-    type_: int
-    class_: int
+class DnsClass(Enum):
+    IN = 1
+
+
+@dataclass(slots=True)
+class Question:
+    name: str
+    _type_: DnsType = DnsType.A
+    _class_: DnsClass = DnsClass.IN
+
+    _struct_ = Struct("!HH")
+
+    def encode(self) -> Iterator[bytes]:
+        yield from encode_name(self.name)
+        yield self._struct_.pack(self._type_.value, self._class_.value)
+
+    @classmethod
+    def decode(cls, buffer: bytes, *, offset: int) -> tuple[Self, int]:
+        name, offset = decode_name(buffer, offset)
+        (typ, clas), offset = unpack_from(cls._struct_, buffer, offset)
+        self = cls(name, DnsType(typ), DnsClass(clas))
+        return self, offset
+
+
+@dataclass(slots=True)
+class Record:
+    name: str
     ttl: int
+
+    _struct_ = Struct("!HHIH")
+
+    @staticmethod
+    def decode(buffer: bytes, *, offset: int) -> tuple["Record", int]:
+        name, offset = decode_name(buffer, offset)
+        (typ, clas, ttl, data_len), offset = unpack_from(
+            Record._struct_, buffer, offset
+        )
+        end = offset + data_len
+
+        if clas == DnsClass.IN.value:
+            if typ == DnsType.A.value and data_len == 4:
+                addr = socket.inet_ntop(socket.AF_INET, buffer[offset:end])
+                return RecordInetA(name, ttl, addr), end
+            if typ == DnsType.AAAA.value and data_len == 16:
+                addr = socket.inet_ntop(socket.AF_INET6, buffer[offset:end])
+                return RecordInetAAAA(name, ttl, addr), end
+            if typ == DnsType.CNAME.value:
+                target, _ = decode_name(buffer, offset)
+                return RecordInetCNAME(name, ttl, target), end
+            if typ == DnsType.PTR.value:
+                target, _ = decode_name(buffer, offset)
+                return RecordInetPTR(name, ttl, target), end
+            if typ == DnsType.SOA.value:
+                fields, _ = RecordInetSOA.decode_fields(buffer, offset)
+                return RecordInetSOA(name, ttl, *fields), end
+            if typ == DnsType.SRV.value:
+                fields, _ = RecordInetSRV.decode_fields(buffer, offset)
+                return RecordInetSRV(name, ttl, *fields), end
+            if typ == DnsType.TXT.value:
+                strings = RecordInetTXT.decode_strings(buffer, offset, end)
+                return RecordInetTXT(name, ttl, strings), end
+            if typ == DnsType.MX.value:
+                fields, _ = RecordInetMX.decode_fields(buffer, offset)
+                return RecordInetMX(name, ttl, *fields), end
+
+        self = RecordOther(name, ttl, DnsType(typ), DnsClass(clas), buffer[offset:end])
+        return self, end
+
+
+@dataclass(slots=True)
+class RecordOther(Record):
+    _type_: DnsType
+    _class_: DnsClass
     data: bytes
 
 
-@dataclass
-class DNSPacket:
-    header: DNSHeader
-    questions: list[DNSQuestion]
-    answers: list[DNSRecord]
-    authorities: list[DNSRecord]
-    additionals: list[DNSRecord]
+@dataclass(slots=True)
+class RecordInetA(Record):
+    address: str
 
 
-def header_to_bytes(header: DNSHeader) -> bytes:
-    fields = dataclasses.astuple(header)
-    return struct.pack("!HHHHHH", *fields)
+@dataclass(slots=True)
+class RecordInetAAAA(Record):
+    address: str
 
 
-def question_to_bytes(question: DNSQuestion) -> bytes:
-    return question.name + struct.pack(
-        "!HH",
-        question.type_,
-        question.class_,
+@dataclass(slots=True)
+class RecordInetCNAME(Record):
+    target: str
+
+
+@dataclass(slots=True)
+class RecordInetTXT(Record):
+    text: list[str]
+
+    @staticmethod
+    def decode_strings(buffer: bytes, offset: int, end: int) -> list[str]:
+        result = []
+        while offset < end:
+            start = offset + 1
+            offset = start + buffer[offset]
+            result.append(buffer[start:offset].decode("ascii"))
+
+        return result
+
+
+@dataclass(slots=True)
+class RecordInetPTR(Record):
+    target: str
+
+
+@dataclass(slots=True)
+class RecordInetSRV(Record):
+    priority: int
+    weight: int
+    port: int
+    target: str
+
+    _struct_ = Struct("!HHH")
+
+    @classmethod
+    def decode_fields(cls, buffer: bytes, offset: int) -> tuple[list[str | Any], int]:
+        fields, offset = unpack_from(cls._struct_, buffer, offset)
+        target, offset = decode_name(buffer, offset)
+        return [*fields, target], offset
+
+
+@dataclass(slots=True)
+class RecordInetMX(Record):
+    exchange: str
+    preference: int
+
+    _struct_ = Struct("!H")
+
+    @classmethod
+    def decode_fields(cls, buffer: bytes, offset: int) -> tuple[tuple, int]:
+        fields, offset = unpack_from(cls._struct_, buffer, offset)
+        exchange, offset = decode_name(buffer, offset)
+        return (exchange, *fields), offset
+
+
+@dataclass(slots=True)
+class RecordInetSOA(Record):
+    master_name: str
+    responsible_name: str
+    serial_num: int
+    refresh_num: int
+    retry_num: int
+    expire_num: int
+    minimum_num: int
+
+    _struct_ = Struct("!IIIII")
+
+    @classmethod
+    def decode_fields(cls, buffer: bytes, offset: int) -> tuple[tuple, int]:
+        mname, offset = decode_name(buffer, offset)
+        rname, offset = decode_name(buffer, offset)
+        fields, offset = unpack_from(cls._struct_, buffer, offset)
+        return (mname, rname, *fields), offset
+
+
+RECURSION_DESIRED = 1 << 8
+
+
+@dataclass(slots=True)
+class Header:
+    id: int
+    flags: int
+    questions: list[Question] = field(default_factory=list)
+    answers: list[Record] = field(default_factory=list)
+    authorities: list[Record] = field(default_factory=list)
+    additionals: list[Record] = field(default_factory=list)
+
+    _struct_ = Struct("!HHHHHH")
+
+    def encode(self) -> bytes:
+        return b"".join(self._encode())
+
+    def _encode(self) -> Iterator[bytes]:
+        assert len(self.questions) == 1, "only one question supported by DNS"
+        assert not self.answers
+        assert not self.authorities
+        assert not self.additionals
+
+        yield self._struct_.pack(
+            self.id,
+            self.flags,
+            len(self.questions),
+            0,
+            0,
+            0,
+        )
+
+        for qn in self.questions:
+            yield from qn.encode()
+
+    @classmethod
+    def decode(cls, buffer: bytes, offset: int) -> tuple[Self, int]:
+        (
+            id,
+            flags,
+            num_qns,
+            num_ans,
+            num_auth,
+            num_extra,
+        ), offset = unpack_from(cls._struct_, buffer, offset)
+
+        self = cls(id, flags)
+        for _ in range(num_qns):
+            qn, offset = Question.decode(buffer, offset=offset)
+            self.questions.append(qn)
+
+        for _ in range(num_ans):
+            ans, offset = Record.decode(buffer, offset=offset)
+            self.answers.append(ans)
+
+        for _ in range(num_auth):
+            ans, offset = Record.decode(buffer, offset=offset)
+            self.authorities.append(ans)
+
+        for _ in range(num_extra):
+            ans, offset = Record.decode(buffer, offset=offset)
+            self.additionals.append(ans)
+
+        return self, offset
+
+
+def make_question(
+    name: str,
+    qtype: str = "A",
+    *,
+    id: int | None = None,
+    flags: int = RECURSION_DESIRED,
+) -> Header:
+    if id is None:
+        id = randrange(65536)
+    qn = Question(
+        name,
+        _type_=getattr(DnsType, qtype),
     )
+    return Header(id=id, flags=flags, questions=[qn])
 
 
-def encode_dns_name(domain_name):
-    encoded = b""
-    for part in domain_name.encode("ascii").split(b"."):
-        encoded += bytes([len(part)]) + part
+def decode_response(buffer: bytes) -> Header:
+    result, offset = Header.decode(buffer, 0)
+    if offset != len(buffer):
+        print("extra bytes after packet")
 
-    return encoded + b"\x00"
-
-
-def build_query(domain_name, record_type):
-    name = encode_dns_name(domain_name)
-    id = random.randint(0, 65535)
-    header = DNSHeader(id, num_questions=1, flags=0)
-    question = DNSQuestion(name, type_=record_type, class_=CLASS_IN)
-    return header_to_bytes(header) + question_to_bytes(question)
-
-
-def send_query(ip_address, domain_name, record_type):
-    query = build_query(domain_name, record_type)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(query, (ip_address, 53))
-
-    data, _ = sock.recvfrom(1024)
-    return parse_dns_packet(data)
-
-
-def parse_header(reader):
-    items = struct.unpack("!HHHHHH", reader.read(12))
-    return DNSHeader(*items)
-
-
-def decode_compressed_name(length, reader):
-    pointer_bytes = bytes([length & 0b0011_1111]) + reader.read(1)
-    pointer = struct.unpack("!H", pointer_bytes)[0]
-    current_pos = reader.tell()
-    reader.seek(pointer)
-    result = decode_name(reader)
-    reader.seek(current_pos)
     return result
 
 
-def decode_name(reader):
-    parts = []
-    while (length := reader.read(1)[0]) != 0:
-        if length & 0b1100_0000:
-            parts.append(decode_compressed_name(length, reader))
-            break
-        else:
-            parts.append(reader.read(length))
-
-    return b".".join(parts)
-
-
-def parse_question(reader):
-    name = decode_name(reader)
-    data = reader.read(4)
-    type_, class_ = struct.unpack("!HH", data)
-    return DNSQuestion(name, type_, class_)
-
-
-def parse_record(reader):
-    name = decode_name(reader)
-    data = reader.read(10)
-    type_, class_, ttl, data_len = struct.unpack("!HHIH", data)
-
-    if type_ == TYPE_NS:
-        data = decode_name(reader)
-    elif type_ == TYPE_A:
-        data = ip_to_str(reader.read(data_len))
-    else:
-        data = reader.read(data_len)
-
-    return DNSRecord(name, type_, class_, ttl, data)
-
-
-def parse_dns_packet(data):
-    reader = BytesIO(data)
-    header = parse_header(reader)
-    questions = [parse_question(reader) for _ in range(header.num_questions)]
-    answers = [parse_record(reader) for _ in range(header.num_answers)]
-    authorities = [parse_record(reader) for _ in range(header.num_authorities)]
-    additionals = [parse_record(reader) for _ in range(header.num_additionals)]
-
-    return DNSPacket(header, questions, answers, authorities, additionals)
-
-
-def ip_to_str(ip):
-    return ".".join([str(x) for x in ip])
-
-
-def get_answer(packet):
-    for answer in packet.answers:
-        if answer.type_ == TYPE_A:
-            return answer.data
-
-
-def get_nameserver_ip(packet):
-    for additional in packet.additionals:
-        if additional.type_ == TYPE_A:
-            return additional.data
-
-
-def get_nameserver(packet):
-    for authority in packet.authorities:
-        if authority.type_ == TYPE_NS:
-            return authority.data.decode("utf-8")
-
-
-def resolve(domain_name, record_type):
-    nameserver = "198.41.0.4"
-    while True:
-        print(f"Querying {nameserver} for {domain_name}")
-        response = send_query(nameserver, domain_name, record_type)
-        if ip := get_answer(response):
-            return ip
-        elif nsIP := get_nameserver_ip(response):
-            nameserver = nsIP
-        elif ns_domain := get_nameserver(response):
-            nameserver = resolve(ns_domain, TYPE_A)
-        else:
-            raise Exception("Something went wrong!")
-
-
 if __name__ == "__main__":
-    response = resolve(
-        "twitter.com",
-        TYPE_A,
-    )
+    qn = make_question("google.com", "A")
 
-    print(response)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(("8.8.8.8", 53))
+        sock.send(qn.encode())
+
+        res = sock.recv(1024)
+
+    for ans in decode_response(res).answers:
+        print(ans)
